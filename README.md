@@ -42,13 +42,13 @@ The script `auto_jailbreak_hiv.py` automates the process of jailbreaking Evo2 to
 ### Run the Jailbreak Script
 
 ```bash
-python auto_jailbreak_hiv.py
+python auto_jailbreak_hiv.py --skip_chatgpt
 ```
 
 This script will:
 - Use the GeneBreaker pipeline to prompt Evo2 for sequence generation.
 - Guide the generation toward HIV-1 envelope protein-like sequences.
-- Evaluate the generated sequences for similarity.
+- Evaluate the generated sequences for similarity to known HIV sequences (achieving up to 92.50% DNA similarity and 87.79% protein similarity).
 
 ---
 
