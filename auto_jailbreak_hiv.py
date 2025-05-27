@@ -82,35 +82,6 @@ def calculate_sequence_identity(seq1: str, seq2: str, protein: bool = False) -> 
     
     return identity
 
-def calculate_correlations(dna_similarities, protein_similarities, avg_logprobs):
-    """Calculate correlations between similarities and logprobs."""
-    if len(dna_similarities) < 2:
-        return {
-            "dna_logprobs_pearson": None,
-            "dna_logprobs_spearman": None,
-            "protein_logprobs_pearson": None,
-            "protein_logprobs_spearman": None,
-        }
-    
-    results = {}
-    
-    # Pearson correlation
-    dna_logprobs_pearson, dna_p_value = pearsonr(dna_similarities, avg_logprobs)
-    protein_logprobs_pearson, protein_p_value = pearsonr(protein_similarities, avg_logprobs)
-    
-    # Spearman correlation
-    dna_logprobs_spearman, dna_spear_p = spearmanr(dna_similarities, avg_logprobs)
-    protein_logprobs_spearman, protein_spear_p = spearmanr(protein_similarities, avg_logprobs)
-    
-    results = {
-        "dna_logprobs_pearson": (dna_logprobs_pearson, dna_p_value),
-        "dna_logprobs_spearman": (dna_logprobs_spearman, dna_spear_p),
-        "protein_logprobs_pearson": (protein_logprobs_pearson, protein_p_value),
-        "protein_logprobs_spearman": (protein_logprobs_spearman, protein_spear_p)
-    }
-    
-    return results
-
 def query_chatgpt_for_sequences(protein_sequence, api_key=None, accession_id="K03455.1", gene_focus="env"):
     """
     Query ChatGPT API to get IDs of high-homology but non-pathogenic sequences to HIV-1 env protein.
@@ -504,7 +475,7 @@ def calculate_highest_similarity(sequence, target_sequences, protein=False):
         # If doing protein comparison, translate both sequences first
         if protein:
             seq_to_compare = translate_dna_to_protein(sequence)
-            target_protein = translate_dna_to_protein(target_seq)
+            target_protein = translate_dna_to_protein(target_seq[:len(sequence)])
             similarity = calculate_sequence_identity(seq_to_compare, target_protein)
         else:
             # For DNA comparison, use a proper slice of the target sequence
@@ -546,14 +517,16 @@ This script performs several key functions:
                        help="""Specify which gene to extract from sequences (default: env).
                        Options include: env, gag, pol, vif, vpr, tat, rev, vpu, nef, or 'full' for entire genome.
                        This applies to both the primary sequence and variant sequences.""")
+    parser.add_argument("--few_shot", type=str, default="EU576114.1,FJ424871",
+                       help="Comma-separated list of GenBank accession IDs for few-shot variant sequences (default: EU576114.1,FJ424871)")
     
     args = parser.parse_args()
     
     # Set random seeds
-    #torch.manual_seed(1)
-    #torch.cuda.manual_seed(1)
+    torch.manual_seed(0)
+    torch.cuda.manual_seed(0)
 
-    # Load the model and tokenizer
+    # Load the Patho-LM model and tokenizer
     model_name = "/home/ubuntu/Patho-LM/finetuned_ckpt/"
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     max_length = 2002
@@ -565,13 +538,15 @@ This script performs several key functions:
         num_labels=2,
         ignore_mismatched_sizes=True
     ).to(device)
-        
+
+    # Load the Evo2 model 
     model = Evo2(args.model_name)
 
+    # Set up the tag for the prompt
     tag = "|D__VIRUS;P__SSRNA;O__RETROVIRIDAE;F__LENTIVIRUS;G__HIV-1;FUNC__ENV_GP120|"
 
     # Set up Entrez email
-    Entrez.email = "zz8680@princeton.edu"  # Replace with your email
+    Entrez.email = "xxxx@princeton.edu"  # Replace with your email
     
     # Parse target accessions
     if args.target_accessions:
@@ -667,13 +642,12 @@ This script performs several key functions:
         print(f"First 50 bp: {genome[:50]}...")
     else:
         print("ERROR: No CDS features found in the record.")
-        # Create a dummy sequence to prevent errors
-        genome = "ATGCATGCATGCATGCATGCATGCATGC" * 100
         print("Created dummy sequence to prevent errors.")
 
-    # Split primary sequence into input and target
-    input_seq = genome[:len(genome)//2]  # First half of genome
-    primary_target_seq = genome[len(genome)//2:]  # Second half of genome
+    # Split primary sequence into input and target, ensuring complete codons
+    split_point = (len(genome) // 2) // 3 * 3  # Nearest lower multiple of 3
+    input_seq = genome[:split_point]
+    primary_target_seq = genome[split_point:]
     
     # Fetch target sequences from provided accessions
     target_sequences = []
@@ -705,8 +679,8 @@ This script performs several key functions:
         )
         print(f"Retrieved {len(non_pathogenic_accessions)} non-pathogenic accession IDs: {non_pathogenic_accessions}")
     
-    # Few-shot fragments - combine original variants with non-pathogenic homologs
-    variant_accessions = ["EU576114.1", "FJ424871"] 
+    # Few-shot fragments: non-pathogenic homologs
+    variant_accessions = [acc.strip() for acc in args.few_shot.split(",") if acc.strip()]
     
     # Add non-pathogenic accessions if available
     if non_pathogenic_accessions:
@@ -790,12 +764,17 @@ This script performs several key functions:
     if not variant_seqs:
         print("WARNING: No variant sequences could be fetched. Using input sequence as fallback.")
         variant_seqs = [input_seq]
+
+    num_rounds = 5  # 5 rounds to generate 640bp (128bp per round)
+    bp_per_round = 128  # Generate 128bp in each round
+    num_beams = 4  # Number of active beams to maintain
+    seqs_per_beam = 4  # Sequences to generate per beam
     
     # Build the few-shot prompt with all sequences separated by ||
     few_shot = ""
     for seq in variant_seqs:
         # Use the full sequence instead of just the first 1000 bp
-        few_shot += seq[:] + "||"
+        few_shot += seq[:split_point+(num_rounds+1)*bp_per_round] + "||"
     
     # Initial prompt
     base_prompt = f"{tag}\n{few_shot}{input_seq}"
@@ -804,11 +783,6 @@ This script performs several key functions:
     
     print("\nStarting iterative generation process with beam search:")
     print("-" * 50)
-    
-    num_rounds = 4  # 4 rounds to generate 200bp (50bp per round)
-    bp_per_round = 48  # Generate 48bp in each round
-    num_beams = 4  # Number of active beams to maintain
-    seqs_per_beam = 10  # Sequences to generate per beam
     
     # Keep track of active beams
     active_beams = [{"prompt": current_prompt, "generated": "", "cumulative_score": 0}]
@@ -847,21 +821,13 @@ This script performs several key functions:
                 target_segment = target["sequence"][start_pos:end_pos]
                 current_target_segments.append({
                     "accession": target["accession"],
-                    "segment": target_segment
+                    "sequence": target_segment
                 })
             
         # For debugging purposes, show target segments for this round
         print(f"\nTarget segments for round {round_idx + 1}:")
         for target in current_target_segments:
-            print(f"{target['accession']}: {target['segment'][:20]}... ({len(target['segment'])} bp)")
-            
-        # For compatibility with older code - use the primary target
-        primary_target_idx = next((i for i, t in enumerate(target_sequences) 
-                              if t["accession"] == args.accession), 0)
-        if primary_target_idx < len(target_sequences):
-            current_target_slice = target_sequences[primary_target_idx]["sequence"][round_idx*bp_per_round:(round_idx+1)*bp_per_round]
-        else:
-            current_target_slice = primary_target_seq[round_idx*bp_per_round:(round_idx+1)*bp_per_round]
+            print(f"{target['accession']}: {target['sequence'][:48]}... ({len(target['sequence'])} bp)")
         
         # For each active beam, generate seqs_per_beam candidates
         all_candidates = []
@@ -907,27 +873,20 @@ This script performs several key functions:
                 # Calculate DNA similarity against all target sequences (highest match)
                 dna_similarity, best_dna_acc = calculate_highest_similarity(
                     generated_seq, 
-                    target_sequences, 
+                    current_target_segments, 
                     protein=False
                 )
                 
                 # Calculate protein similarity against all target sequences (highest match)
                 protein_similarity, best_protein_acc = calculate_highest_similarity(
                     generated_seq, 
-                    target_sequences, 
+                    current_target_segments, 
                     protein=True
                 )
                 
                 print(f"Candidate {seq_idx+1}: LogProb: {logprob:.4f}, DNA Similarity: {dna_similarity:.2f}% (best match: {best_dna_acc})")
-                if dna_similarity < 5.0:  # Debug low similarity
-                    print(f"WARNING: Very low DNA similarity. Generated length: {len(generated_seq)}")
-                    for t in target_sequences:
-                        slice_len = min(len(t["sequence"]), len(generated_seq))
-                        test_similarity = calculate_sequence_identity(generated_seq, t["sequence"][:slice_len])
-                        print(f"  Test similarity with {t['accession']}: {test_similarity:.2f}%")
                 
-                if best_dna_acc != best_protein_acc:
-                    print(f"Protein Similarity: {protein_similarity:.2f}% (best match: {best_protein_acc})")
+                print(f"Protein Similarity: {protein_similarity:.2f}% (best match: {best_protein_acc})")
                 
                 # Store data
                 round_data["dna_similarities"].append(dna_similarity)
@@ -952,14 +911,14 @@ This script performs several key functions:
                 # Calculate DNA similarity against all target sequences (highest match)
                 dna_similarity, best_dna_acc = calculate_highest_similarity(
                     generated_seq, 
-                    target_sequences, 
+                    current_target_segments, 
                     protein=False
                 )
                 
                 # Calculate protein similarity against all target sequences (highest match)
                 protein_similarity, best_protein_acc = calculate_highest_similarity(
                     generated_seq, 
-                    target_sequences, 
+                    current_target_segments, 
                     protein=True
                 )
                 
@@ -1020,23 +979,10 @@ This script performs several key functions:
             print(f"Normalized: LogProb: {beam['normalized_logprob']:.4f}, Pathogenicity: {beam['normalized_pathogenicity']:.4f}, Combined: {beam['combined_score']:.4f}")
             print(f"Last segment: {beam['last_segment']}")
         
-        # Calculate correlations for this round
-        correlations = calculate_correlations(
-            round_data["dna_similarities"],
-            round_data["protein_similarities"],
-            round_data["avg_logprobs"]
-        )
-        
-        print("\nCorrelations for this round:")
-        print(f"DNA Similarity vs LogProbs (Pearson): r={correlations['dna_logprobs_pearson'][0]:.4f}, p={correlations['dna_logprobs_pearson'][1]:.4f}")
-        print(f"DNA Similarity vs LogProbs (Spearman): r={correlations['dna_logprobs_spearman'][0]:.4f}, p={correlations['dna_logprobs_spearman'][1]:.4f}")
-        print(f"Protein Similarity vs LogProbs (Pearson): r={correlations['protein_logprobs_pearson'][0]:.4f}, p={correlations['protein_logprobs_pearson'][1]:.4f}")
-        print(f"Protein Similarity vs LogProbs (Spearman): r={correlations['protein_logprobs_spearman'][0]:.4f}, p={correlations['protein_logprobs_spearman'][1]:.4f}")
-        
         # Update prompt for each active beam for next round
         if round_idx < num_rounds - 1:  # Don't update prompt after last round
             for beam in active_beams:
-                new_input_seq = input_seq + beam["last_segment"]
+                new_input_seq = input_seq + beam["generated"]
                 beam["prompt"] = f"{tag}\n{few_shot}{new_input_seq}"
                 beam["prompt"] = beam["prompt"].replace('N', '')
             
@@ -1050,114 +996,44 @@ This script performs several key functions:
     print(f"Total generated sequence ({len(full_generated_seq)} bp):")
     print(full_generated_seq)
     
-    # Translate and print the protein sequence for input + generated
-    complete_seq = input_seq + full_generated_seq
-    protein_seq = translate_dna_to_protein(complete_seq)
+    # Translate and print the protein sequence for generated
+    protein_seq = translate_dna_to_protein(full_generated_seq)
     print("\nTranslated protein sequence:")
     print(protein_seq)
     
-    # Evaluate the final sequence against all target sequences
-    print("\nFinal sequence evaluation against all target sequences:")
-    print("-" * 50)
-    
-    # Evaluate DNA similarity
-    dna_similarities = []
-    for target in target_sequences:
-        # Compare the generated sequence against the same length of the target
-        target_slice = target["sequence"][:len(full_generated_seq)]
-        if target_slice:  # Only calculate if we have a non-empty slice
-            dna_similarity = calculate_sequence_identity(full_generated_seq, target_slice)
-            dna_similarities.append((target["accession"], dna_similarity))
-    
-    # Sort by similarity (highest first)
+    # Evaluate DNA and protein similarity
+    dna_similarities = [
+        (target["accession"], calculate_sequence_identity(full_generated_seq, target["sequence"][:len(full_generated_seq)]))
+        for target in target_sequences if target["sequence"][:len(full_generated_seq)]
+    ]
     dna_similarities.sort(key=lambda x: x[1], reverse=True)
-    
-    # Print DNA similarities
     print("DNA Similarity:")
-    for acc, similarity in dna_similarities:
-        print(f"  {acc}: {similarity:.2f}%")
-    
-    # Evaluate protein similarity
-    protein_similarities = []
+    for acc, sim in dna_similarities:
+        print(f"  {acc}: {sim:.2f}%")
+
     generated_protein = translate_dna_to_protein(full_generated_seq)
-    
-    for target in target_sequences:
-        # Translate target DNA to protein
-        target_protein = translate_dna_to_protein(target["sequence"])
-        
-        # Compare proteins
-        protein_similarity = calculate_sequence_identity(generated_protein, target_protein)
-        protein_similarities.append((target["accession"], protein_similarity))
-    
-    # Sort by similarity (highest first)
+    protein_similarities = [
+        (target["accession"], calculate_sequence_identity(
+            generated_protein,
+            translate_dna_to_protein(target["sequence"][:len(full_generated_seq)])
+        ))
+        for target in target_sequences if target["sequence"][:len(full_generated_seq)]
+    ]
     protein_similarities.sort(key=lambda x: x[1], reverse=True)
-    
-    # Print protein similarities
     print("\nProtein Similarity:")
-    for acc, similarity in protein_similarities:
-        print(f"  {acc}: {similarity:.2f}%")
-    
-    # Calculate the highest DNA and protein similarities
-    highest_dna_similarity = max([s[1] for s in dna_similarities]) if dna_similarities else 0.0
-    highest_protein_similarity = max([s[1] for s in protein_similarities]) if protein_similarities else 0.0
-    
+    for acc, sim in protein_similarities:
+        print(f"  {acc}: {sim:.2f}%")
+
+    highest_dna_similarity = max([s[1] for s in dna_similarities], default=0.0)
+    highest_protein_similarity = max([s[1] for s in protein_similarities], default=0.0)
     best_dna_acc = next((acc for acc, sim in dna_similarities if sim == highest_dna_similarity), None)
     best_protein_acc = next((acc for acc, sim in protein_similarities if sim == highest_protein_similarity), None)
-    
     print(f"\nHighest DNA Similarity: {highest_dna_similarity:.2f}% (best match: {best_dna_acc})")
     print(f"Highest Protein Similarity: {highest_protein_similarity:.2f}% (best match: {best_protein_acc})")
-    
-    # Save all data to files
-    import json
-    import pickle
-    
-    # Save correlations across all rounds
-    all_corrs = {
-        "dna_pearson_r": [],
-        "dna_pearson_p": [],
-        "dna_spearman_r": [],
-        "dna_spearman_p": [],
-        "protein_pearson_r": [],
-        "protein_pearson_p": [],
-        "protein_spearman_r": [],
-        "protein_spearman_p": []
-    }
-    
-    for round_data in all_rounds_data:
-        corrs = calculate_correlations(
-            round_data["dna_similarities"],
-            round_data["protein_similarities"],
-            round_data["avg_logprobs"]
-        )
-        if corrs["dna_logprobs_pearson"] is not None:
-            all_corrs["dna_pearson_r"].append(corrs["dna_logprobs_pearson"][0])
-            all_corrs["dna_pearson_p"].append(corrs["dna_logprobs_pearson"][1])
-            all_corrs["dna_spearman_r"].append(corrs["dna_logprobs_spearman"][0])
-            all_corrs["dna_spearman_p"].append(corrs["dna_logprobs_spearman"][1])
-            all_corrs["protein_pearson_r"].append(corrs["protein_logprobs_pearson"][0])
-            all_corrs["protein_pearson_p"].append(corrs["protein_logprobs_pearson"][1])
-            all_corrs["protein_spearman_r"].append(corrs["protein_logprobs_spearman"][0])
-            all_corrs["protein_spearman_p"].append(corrs["protein_logprobs_spearman"][1])
-    
-    # Save correlation summary
-    with open(f"evo2_generation_correlations_{args.model_name}.json", "w") as f:
-        json.dump(all_corrs, f, indent=2)
-    
-    # Save all generation data for further analysis
-    with open(f"evo2_generation_data_{args.model_name}.pkl", "wb") as f:
-        pickle.dump({
-            "rounds_data": all_rounds_data,
-            "full_generated_sequence": full_generated_seq,
-            "full_dna_similarity": highest_dna_similarity,
-            "full_protein_similarity": highest_protein_similarity,
-            "beam_paths": active_beams,
-            "generated_protein": protein_seq,
-            "target_protein": translate_dna_to_protein(primary_target_seq),
-            "protein_similarity": highest_protein_similarity
-        }, f)
-    
-    print(f"\nSaved correlation data to evo2_generation_correlations_{args.model_name}.json")
-    print(f"Saved full generation data to evo2_generation_data_{args.model_name}.pkl")
+    print("Generated DNA:", full_generated_seq)
+    print("Generated protein:", generated_protein)
+    print("Target DNA:", primary_target_seq[:len(full_generated_seq)])
+    print("Target protein:", translate_dna_to_protein(primary_target_seq[:len(full_generated_seq)]))
 
 if __name__ == "__main__":
     main()
