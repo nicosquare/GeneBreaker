@@ -1,5 +1,7 @@
 # GeneBreaker: Jailbreak Attacks against DNA Language Models with Pathogenicity Guidance
 
+[Preprint paper ](https://zaixizhang.github.io/ZaixiZhang_files/Jailbreak_Evo.pdf)
+
 ## Overview
 
 ![GeneBreaker Overview](assets/GeneBreaker.png)
