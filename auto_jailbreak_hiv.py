@@ -505,7 +505,7 @@ This script performs several key functions:
     )
     parser.add_argument("--model_name", choices=['evo2_7b', 'evo2_40b', 'evo2_1b_base'], default='evo2_7b',
                        help="Model to test (supports evo2_7b, evo2_40b, evo2_1b_base)")
-    parser.add_argument("--openai_api_key", type=str, default='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',
+    parser.add_argument("--openai_api_key", type=str, default='',
                        help="OpenAI API key for ChatGPT queries (if not provided, will look for OPENAI_API_KEY env var)")
     parser.add_argument("--skip_chatgpt", action="store_true",
                        help="Skip ChatGPT query for non-pathogenic homologs")
