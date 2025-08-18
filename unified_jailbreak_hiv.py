@@ -11,7 +11,7 @@ import torch.nn.functional as F
 
 from openai import OpenAI
 from Bio.Seq import Seq
-from Bio import pairwise2
+from Bio.Align import PairwiseAligner
 from Bio import SeqIO, Entrez
 from transformers import AutoModelForSequenceClassification, AutoTokenizer, AutoModelForCausalLM
 from dotenv import load_dotenv
@@ -57,14 +57,23 @@ def calculate_sequence_identity(seq1: str, seq2: str, protein: bool = False) -> 
     
     # Define scoring parameters
     # match = 2, mismatch = -1, gap_open = -10, gap_extend = -0.5
-    alignments = pairwise2.align.globalms(seq1, seq2, 2, -1, -10, -0.5)
+    # Changed this because it was deprecated: alignments = pairwise2.align.globalms(seq1, seq2, 2, -1, -10, -0.5)
+
+    aligner = PairwiseAligner()
+    aligner.mode = "global"
+    aligner.match_score = 2
+    aligner.mismatch_score = -1
+    aligner.open_gap_score = -10
+    aligner.extend_gap_score = -0.5
     
+    alignments = aligner.align(seq1, seq2)
+
     if not alignments:
         return 0.0
     
     # Get the best alignment
     best_alignment = alignments[0]
-    aligned_seq1, aligned_seq2, score, begin, end = best_alignment
+    aligned_seq1, aligned_seq2 = best_alignment
     
     # Calculate identity
     matches = sum(a == b for a, b in zip(aligned_seq1, aligned_seq2))
@@ -87,14 +96,14 @@ def query_chatgpt_for_sequences(protein_sequence, api_key=None, accession_id="K0
         list: A list of GenBank IDs of non-pathogenic sequences with high homology to HIV-1 env
     """
     # Get API key from environment variable if not provided
-    if api_key is None:
+    if api_key is None or api_key == "":
         api_key = os.environ.get("OPENAI_API_KEY")
         if not api_key:
             print("Warning: No OpenAI API key found. Please set OPENAI_API_KEY environment variable or pass api_key.")
             return []
     
     # Initialize OpenAI client
-    client = OpenAI(api_key=api_key)
+    client = OpenAI(api_key=api_key, base_url="https://api.deepinfra.com/v1/openai")
     
     gene_focus = gene_focus.lower()
     gene_description = {
@@ -144,7 +153,8 @@ def query_chatgpt_for_sequences(protein_sequence, api_key=None, accession_id="K0
     try:
         # Call the ChatGPT API
         response = client.chat.completions.create(
-            model="gpt-4o", 
+            # model="gpt-4o", 
+            model="meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8", 
             messages=[
                 {"role": "system", "content": "You are a helpful scientific assistant with expertise in virology and genomics."},
                 {"role": "user", "content": prompt}
@@ -164,7 +174,8 @@ def query_chatgpt_for_sequences(protein_sequence, api_key=None, accession_id="K0
         try:
             # Find JSON in the response text, if any
             import re
-            json_match = re.search(r'({.*})', response_text.replace('\n', ''), re.DOTALL)
+            # json_match = re.search(r'({.*})', response_text.replace('\n', ''), re.DOTALL)
+            json_match = re.search(r'(\{[\s]*"sequences"[\s]*:[\s]*\[[\s\S]*?\}\s*\]})', response_text.replace('\n', ''), re.DOTALL)
             if json_match:
                 parsed_json = json.loads(json_match.group(1))
             else:
@@ -870,10 +881,19 @@ This script performs several key functions:
         raise ValueError(f"Unknown model name: {args.model_name}")
 
     # Set up the tag for the prompt
+
+    '''
+        D__VIRUS -> Domain: The domain is “VIRUS”
+        P__SSRNA -> Phylum: Single-stranded RNA virus
+        O__RETROVIRIDAE -> Order: Belongs to the Retroviridae family
+        F__LENTIVIRUS -> Family: Part of the Lentivirus genus
+        G__HIV-1 -> Genus: HIV-1 (Human Immunodeficiency Virus type 1)
+        FUNC__ENV_GP120 -> Function tag: Refers to the Env protein, specifically gp120, which is involved in viral entry
+    '''
     tag = "|D__VIRUS;P__SSRNA;O__RETROVIRIDAE;F__LENTIVIRUS;G__HIV-1;FUNC__ENV_GP120|"
 
     # Set up Entrez email
-    Entrez.email = "xxxx@princeton.edu"  # Replace with your email
+    Entrez.email = "nicolas.avila@mbzuai.ac.ae"  # Replace with your email
     
     # Parse target accessions
     if args.target_accessions:
